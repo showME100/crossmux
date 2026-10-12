@@ -186,6 +186,21 @@ constexpr size_t JPEG_DECODER_SIZE = sizeof(JPEGDEC);
 constexpr size_t MIN_FREE_HEAP = JPEG_DECODER_SIZE + 16 * 1024;
 constexpr uint32_t FP_ONE = 1UL << 16;
 
+struct JpegOutputExtent {
+  int width = 0;
+  int height = 0;
+};
+
+int jpegExtentCallback(JPEGDRAW* draw) {
+  auto* extent = reinterpret_cast<JpegOutputExtent*>(draw->pUser);
+  if (!extent || draw->x < 0 || draw->y < 0 || draw->iWidthUsed <= 0 || draw->iHeight <= 0) return 0;
+  const int right = draw->x + draw->iWidthUsed;
+  const int bottom = draw->y + draw->iHeight;
+  if (right > extent->width) extent->width = right;
+  if (bottom > extent->height) extent->height = bottom;
+  return 1;
+}
+
 constexpr int chooseJpegScale(const int srcWidth, const int srcHeight, const int outWidth, const int outHeight) {
   if ((srcWidth + 7) / 8 >= outWidth && (srcHeight + 7) / 8 >= outHeight) return JPEG_SCALE_EIGHTH;
   if ((srcWidth + 3) / 4 >= outWidth && (srcHeight + 3) / 4 >= outHeight) return JPEG_SCALE_QUARTER;
@@ -282,6 +297,7 @@ struct BmpConvertCtx {
 
   uint8_t rowsSinceYield;
   uint8_t blocksSinceYield;
+  int writtenRows;
   bool error;
 };
 
@@ -333,6 +349,8 @@ static void writeOutputRow(BmpConvertCtx* ctx, const uint8_t* srcRow, int outY) 
 
   if (ctx->bmpOut->write(ctx->bmpRow.get(), ctx->bytesPerRow) != static_cast<size_t>(ctx->bytesPerRow)) {
     ctx->error = true;
+  } else {
+    ctx->writtenRows++;
   }
   yieldDuringDecode(ctx);
 }
@@ -457,6 +475,8 @@ static void flushScaledRow(BmpConvertCtx* ctx) {
 
   if (ctx->bmpOut->write(ctx->bmpRow.get(), ctx->bytesPerRow) != static_cast<size_t>(ctx->bytesPerRow)) {
     ctx->error = true;
+  } else {
+    ctx->writtenRows++;
   }
   ctx->currentOutY++;
   yieldDuringDecode(ctx);
@@ -592,7 +612,7 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
   }};
   const ScopedCleanup closeJpeg{[jpeg]() { jpeg->close(); }};
 
-  int rc = jpeg->open("", bmpJpegOpen, bmpJpegClose, bmpJpegRead, bmpJpegSeek, bmpDrawCallback);
+  int rc = jpeg->open("", bmpJpegOpen, bmpJpegClose, bmpJpegRead, bmpJpegSeek, jpegExtentCallback);
   if (rc != 1) {
     LOG_ERR("JPG", "JPEG open failed (err=%d)", jpeg->getLastError());
     return false;
@@ -647,10 +667,41 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
   const int scaleOption =
       progressiveDecode ? JPEG_SCALE_EIGHTH : chooseJpegScale(srcWidth, srcHeight, outWidth, outHeight);
   const int scaleDenominator = scaleOption == 0 ? 1 : scaleOption;
-  const int scaleSrcWidth = (srcWidth + scaleDenominator - 1) / scaleDenominator;
-  const int scaleSrcHeight = (srcHeight + scaleDenominator - 1) / scaleDenominator;
-  LOG_DBG("JPG", "JPEG decoder scale: 1/%d (%dx%d -> %dx%d), output=%dx%d", scaleDenominator, srcWidth, srcHeight,
-          scaleSrcWidth, scaleSrcHeight, outWidth, outHeight);
+  const int estimatedSrcWidth = (srcWidth + scaleDenominator - 1) / scaleDenominator;
+  const int estimatedSrcHeight = (srcHeight + scaleDenominator - 1) / scaleDenominator;
+  LOG_DBG("JPG", "JPEG decoder scale request: 1/%d (%dx%d -> about %dx%d), output=%dx%d", scaleDenominator, srcWidth,
+          srcHeight, estimatedSrcWidth, estimatedSrcHeight, outWidth, outHeight);
+
+  // JPEGDEC callback bounds are authoritative: reduced output can differ from
+  // the nominal scale estimate, so measure them before emitting the BMP header.
+  JpegOutputExtent decodedExtent;
+  jpeg->setPixelType(EIGHT_BIT_GRAYSCALE);
+  jpeg->setUserPointer(&decodedExtent);
+  rc = jpeg->decode(0, 0, scaleOption);
+  if (rc != 1 || decodedExtent.width <= 0 || decodedExtent.height <= 0) {
+    LOG_ERR("JPG", "JPEG dimension probe failed (rc=%d, err=%d, bounds=%dx%d)", rc, jpeg->getLastError(),
+            decodedExtent.width, decodedExtent.height);
+    return false;
+  }
+  if (decodedExtent.width > MAX_IMAGE_WIDTH || decodedExtent.height > MAX_IMAGE_HEIGHT) {
+    LOG_ERR("JPG", "Decoded dimensions exceed limits (%dx%d)", decodedExtent.width, decodedExtent.height);
+    return false;
+  }
+
+  jpeg->close();
+  if (jpeg->open("", bmpJpegOpen, bmpJpegClose, bmpJpegRead, bmpJpegSeek, bmpDrawCallback) != 1) {
+    LOG_ERR("JPG", "Could not reopen JPEG after dimension probe (err=%d)", jpeg->getLastError());
+    return false;
+  }
+  if (jpeg->getWidth() != srcWidth || jpeg->getHeight() != srcHeight) {
+    LOG_ERR("JPG", "JPEG dimensions changed between probe and conversion");
+    return false;
+  }
+
+  const int scaleSrcWidth = decodedExtent.width;
+  const int scaleSrcHeight = decodedExtent.height;
+  LOG_DBG("JPG", "JPEG decoded callback bounds: %dx%d (estimate %dx%d)", scaleSrcWidth, scaleSrcHeight,
+          estimatedSrcWidth, estimatedSrcHeight);
 
   if (scaleSrcWidth != outWidth || scaleSrcHeight != outHeight) {
     scaleX_fp = (static_cast<uint32_t>(scaleSrcWidth) << 16) / outWidth;
@@ -699,6 +750,7 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
   ctx.smoothPrevY = -1;
   ctx.rowsSinceYield = 0;
   ctx.blocksSinceYield = 0;
+  ctx.writtenRows = 0;
   ctx.error = false;
 
   // MCU row buffer: MAX_MCU_HEIGHT rows × decoded srcWidth columns of grayscale
@@ -769,8 +821,9 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(HalFile& jpegFile, Print& b
     finishSmoothUpscale(&ctx);
   }
 
-  if (rc != 1 || ctx.error || checkedOutput.failed) {
-    LOG_ERR("JPG", "JPEG decode failed (rc=%d, err=%d)", rc, jpeg->getLastError());
+  if (rc != 1 || ctx.error || checkedOutput.failed || ctx.writtenRows != outHeight) {
+    LOG_ERR("JPG", "JPEG decode/output incomplete (rc=%d, err=%d, rows=%d/%d)", rc, jpeg->getLastError(),
+            ctx.writtenRows, outHeight);
     return false;
   }
 
