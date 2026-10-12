@@ -305,7 +305,7 @@ void WifiSelectionActivity::processWifiScanResults() {
 
   for (int i = 0; i < scanResult; i++) {
     char ssid[33];
-    strlcpy(ssid, WiFi.SSID(i).c_str(), sizeof(ssid));
+    strncpy(ssid, WiFi.SSID(i).c_str(), sizeof(ssid));
     const int32_t rssi = WiFi.RSSI(i);
 
     // Skip hidden networks (empty SSID)
